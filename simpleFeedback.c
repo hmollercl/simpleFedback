@@ -38,9 +38,13 @@ typedef struct {
     float* attack_ptr;
     float* active_ptr;
 
-    double rate;
-    float* buffer;
-    int sample;
+    double rate;  //sample rate
+
+    float* buffer;  // for recording
+    int sample;  // to know where to read the buffer
+
+    float x[3];  //filter values
+	float y[3];  //filter values
 
 } simpleFeedback;
 
@@ -91,10 +95,27 @@ static void activate (LV2_Handle instance){
 		m->buffer[i] = 0;
 	}
 	m->sample = 0;
+
+    for (int i = 0; i < 3; i++) {
+		m->x[i] = 0;
+		m->y[i] = 0;
+	}
 }
 
 static void run (LV2_Handle instance, uint32_t sample_count){
     simpleFeedback* m = (simpleFeedback*) instance;
+    const float        freq      = 300;
+	const float        q         = 1;
+    //banpdass biquad filter
+	float w0 = 2 * 3.1416 * freq / m->rate;
+	float alpha = sin(w0) / (2 * q);
+	float b0 = (1 - cos(w0)) / 2;
+	float b1 = 1 - cos(w0);
+	float b2 = (1 - cos(w0)) / 2;
+	float a0 = 1 + alpha;
+	float a1 = -2 * cos(w0);
+	float a2 = 1 - alpha;
+
     if (!m) return;
     if ((!m->in_ptr) || (!m->out_ptr) || (!m->level_ptr) || 
         (!m->active_ptr) || (!m->delay_ptr) || (!m->attack_ptr)) return;
@@ -115,7 +136,19 @@ static void run (LV2_Handle instance, uint32_t sample_count){
                 eco_pos = (uint32_t)(m->sample - (*m->delay_ptr * m->rate));
 
             // output = input + eco
-            m->out_ptr[i] = m->in_ptr[i] + m->buffer[eco_pos] * *m->level_ptr;
+            //m->out_ptr[i] = m->in_ptr[i] + m->buffer[eco_pos] * *m->level_ptr;
+            
+            //aplico el filtro
+            m->x[2] = m->x[1]; // x [z-2]
+            m->x[1] = m->x[0]; // x [z-1]
+            //m->x[0] = input[pos]; // x [z]
+            m->x[0] = m->in_ptr[i] + m->buffer[eco_pos] * *m->level_ptr
+            m->y[2] = m->y[1]; // y [z-2]
+            m->y[1] = m->y[0]; // y [z-1]
+            m->y[0] = (b0/a0) * m->x[0] + (b1/a0) * m->x[1] + (b2/a0) * m->x[2]
+                                                    - (a1/a0) * m->y[1] - (a2/a0) * m->y[2];
+            //output[pos] = m->y[0];
+            m->out_ptr[i] = m->y[0];
 
             // save output in buffer
             m->buffer[m->sample] = m->out_ptr[i];
