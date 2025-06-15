@@ -24,7 +24,7 @@
 //#include "stddef.h"
 #include "stdint.h"
 #include "stdlib.h"
-//#include "math.h"
+#include "math.h"
 #include "lv2.h"
 
 #define BUFFER_SIZE 3 // multiplied by sample_rates, 3 -> 3sec.
@@ -37,6 +37,8 @@ typedef struct {
     float* delay_ptr;
     float* attack_ptr;
     float* active_ptr;
+    float* freq_ptr;
+    float* q_ptr;
 
     double rate;  //sample rate
 
@@ -82,6 +84,12 @@ static void connect_port (LV2_Handle instance, uint32_t port, void
     case 5:
         m->attack_ptr = (float*) data_location;
         break;
+    case 6:
+        m->freq_ptr = (float*) data_location;
+        break;
+    case 7:
+        m->q_ptr = (float*) data_location;
+        break;
     default:
         break;
     }
@@ -104,11 +112,12 @@ static void activate (LV2_Handle instance){
 
 static void run (LV2_Handle instance, uint32_t sample_count){
     simpleFeedback* m = (simpleFeedback*) instance;
-    const float        freq      = 300;
-	const float        q         = 1;
+    //const float        freq      = 300;
+	//const float        q         = 1;
+
     //banpdass biquad filter
-	float w0 = 2 * 3.1416 * freq / m->rate;
-	float alpha = sin(w0) / (2 * q);
+	float w0 = 2 * 3.1416 * *m->freq_ptr / m->rate;  // TODO calculate freq
+	float alpha = sin(w0) / (2 * *m->q_ptr);  // TODO define q
 	float b0 = (1 - cos(w0)) / 2;
 	float b1 = 1 - cos(w0);
 	float b2 = (1 - cos(w0)) / 2;
@@ -142,7 +151,7 @@ static void run (LV2_Handle instance, uint32_t sample_count){
             m->x[2] = m->x[1]; // x [z-2]
             m->x[1] = m->x[0]; // x [z-1]
             //m->x[0] = input[pos]; // x [z]
-            m->x[0] = m->in_ptr[i] + m->buffer[eco_pos] * *m->level_ptr
+            m->x[0] = m->in_ptr[i] + m->buffer[eco_pos] * *m->level_ptr;
             m->y[2] = m->y[1]; // y [z-2]
             m->y[1] = m->y[0]; // y [z-1]
             m->y[0] = (b0/a0) * m->x[0] + (b1/a0) * m->x[1] + (b2/a0) * m->x[2]
