@@ -44,6 +44,7 @@ typedef struct {
 
     float* buffer;  // for recording
     int sample;  // to know where to read the buffer
+    uint8_t prev_active; // to know if it was activated before or not.
 
     float x[3];  //filter values
 	float y[3];  //filter values
@@ -104,6 +105,11 @@ static void activate (LV2_Handle instance){
 	}
 	m->sample = 0;
 
+    if(*m->active_ptr < 0.5)
+        m->prev_active = 0;
+    else
+        m->prev_active = 1;
+
     for (int i = 0; i < 3; i++) {
 		m->x[i] = 0;
 		m->y[i] = 0;
@@ -134,8 +140,18 @@ static void run (LV2_Handle instance, uint32_t sample_count){
         for (uint32_t i = 0; i < sample_count; ++i) {
             m->out_ptr[i] = m->in_ptr[i];
         }
+        if (m->prev_active == 1){
+            //if before was activated, clear buffer and restart sample position
+            for (int i = 0; i < m->rate * BUFFER_SIZE; i++) {
+                m->buffer[i] = 0;
+            }
+            m->sample = 0;
+            m->prev_active = 0;
+        }
     }
     else{
+        if (m->prev_active == 0)
+            m->prev_active = 1;
         uint32_t eco_pos;
         for (uint32_t i = 0; i < sample_count; i++) {
             //calculate which position we must read from buffer.
