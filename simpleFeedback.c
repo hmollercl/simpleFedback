@@ -26,8 +26,11 @@
 #include "stdlib.h"
 #include "math.h"
 #include "lv2.h"
+#include "freq_calc.h"
 
-#define BUFFER_SIZE 3 // multiplied by sample_rates, 3 -> 3sec.
+#include "stdio.h"
+
+#define BUFFER_SIZE 1 // multiplied by sample_rates, 3 -> 3sec.
 
 /* class definition */
 typedef struct {
@@ -43,7 +46,9 @@ typedef struct {
     double rate;  //sample rate
 
     float* buffer;  // for recording
+    float* clean_buffer;  // for recording
     int sample;  // to know where to read the buffer
+    float calc_freq;
     uint8_t prev_active; // to know if it was activated before or not.
 
     float x[3];  //filter values
@@ -100,10 +105,13 @@ static void activate (LV2_Handle instance){
     simpleFeedback* m = (simpleFeedback*) instance;
 
 	m->buffer = malloc(m->rate * BUFFER_SIZE * sizeof(float));
+    m->clean_buffer = malloc(m->rate * BUFFER_SIZE * sizeof(float));
 	for (int i = 0; i < m->rate * BUFFER_SIZE; i++) {
 		m->buffer[i] = 0;
+        m->clean_buffer[i] = 0;
 	}
 	m->sample = 0;
+    m->calc_freq = 0;
 
     if(*m->active_ptr < 0.5)
         m->prev_active = 0;
@@ -118,23 +126,47 @@ static void activate (LV2_Handle instance){
 
 static void run (LV2_Handle instance, uint32_t sample_count){
     simpleFeedback* m = (simpleFeedback*) instance;
-    //const float        freq      = 300;
-	//const float        q         = 1;
-
-    //banpdass biquad filter
-	float w0 = 2 * 3.1416 * *m->freq_ptr / m->rate;  // TODO calculate freq
-	float alpha = sin(w0) / (2 * *m->q_ptr);  // TODO define q
-	float b0 = (1 - cos(w0)) / 2;
-	float b1 = 1 - cos(w0);
-	float b2 = (1 - cos(w0)) / 2;
-	float a0 = 1 + alpha;
-	float a1 = -2 * cos(w0);
-	float a2 = 1 - alpha;
+    float w0;
+    float alpha;
+    float b0=1;
+    float b1=1;
+    float b2=1;
+    float a0=1;
+    float a1=1;
+    float a2=1;
+    float temp_freq = 0;
 
     if (!m) return;
     if ((!m->in_ptr) || (!m->out_ptr) || (!m->level_ptr) || 
         (!m->active_ptr) || (!m->delay_ptr) || (!m->attack_ptr)) return;
 
+    if (m->sample > (4 * m->rate / 300)){ //because win_length is rate/300 *2
+        temp_freq = (float) (fft_freq(m->clean_buffer, m->sample, BUFFER_SIZE * m->rate, m->rate));
+        //temp_freq = (float) (amdf_freq(m->clean_buffer, m->sample, BUFFER_SIZE * m->rate, m->rate));
+        //temp_freq = (float) (asdf_freq(m->clean_buffer, m->sample, BUFFER_SIZE * m->rate, m->rate));
+        //temp_freq = (float) (acf_freq(m->clean_buffer, m->sample, BUFFER_SIZE * m->rate, m->rate));
+        //temp_freq = 742;
+        //printf("%f \n",temp_freq);
+
+        //if (temp_freq > 1 & (m->calc_freq > 2*temp_freq | m->calc_freq < temp_freq/2)){
+        //if (temp_freq > 1 && temp_freq != m->calc_freq){
+        if (temp_freq > 1 && temp_freq){
+            m->calc_freq = temp_freq;
+
+            printf("%f \n",m->calc_freq);
+            //banpdass biquad filter
+            w0 = 2 * 3.1416 * (m->calc_freq) / m->rate;  // TODO calculate freq
+            alpha = sin(w0) / (2 * *m->q_ptr);  // TODO define q
+            b0 = (1 - cos(w0)) / 2;
+            b1 = 1 - cos(w0);
+            b2 = (1 - cos(w0)) / 2;
+            a0 = 1 + alpha;
+            a1 = -2 * cos(w0);
+            a2 = 1 - alpha;
+        }
+    }
+
+    //TODO creo que acá es más simple si no está active escribir 0s.
     if (*m->active_ptr < 0.5) { // or active_state == false if using boolean
         // Bypass: Copy input to output
         for (uint32_t i = 0; i < sample_count; ++i) {
@@ -144,6 +176,7 @@ static void run (LV2_Handle instance, uint32_t sample_count){
             //if before was activated, clear buffer and restart sample position
             for (int i = 0; i < m->rate * BUFFER_SIZE; i++) {
                 m->buffer[i] = 0;
+                m->clean_buffer[i] = 0;
             }
             m->sample = 0;
             m->prev_active = 0;
@@ -163,20 +196,25 @@ static void run (LV2_Handle instance, uint32_t sample_count){
             // output = input + eco
             //m->out_ptr[i] = m->in_ptr[i] + m->buffer[eco_pos] * *m->level_ptr;
             
-            //aplico el filtro
-            m->x[2] = m->x[1]; // x [z-2]
-            m->x[1] = m->x[0]; // x [z-1]
-            //m->x[0] = input[pos]; // x [z]
-            m->x[0] = m->in_ptr[i] + m->buffer[eco_pos] * *m->level_ptr;
-            m->y[2] = m->y[1]; // y [z-2]
-            m->y[1] = m->y[0]; // y [z-1]
-            m->y[0] = (b0/a0) * m->x[0] + (b1/a0) * m->x[1] + (b2/a0) * m->x[2]
-                                                    - (a1/a0) * m->y[1] - (a2/a0) * m->y[2];
+            
             //output[pos] = m->y[0];
-            m->out_ptr[i] = m->y[0];
+            if (m->calc_freq < 20000){
+                //bandpass biquad filter apply
+                m->x[2] = m->x[1]; // x [z-2]
+                m->x[1] = m->x[0]; // x [z-1]
+                m->x[0] = m->in_ptr[i] + m->buffer[eco_pos] * *m->level_ptr; // x [z]
+                m->y[2] = m->y[1]; // y [z-2]
+                m->y[1] = m->y[0]; // y [z-1]
+                m->y[0] = ((b0/a0) * m->x[0] + (b1/a0) * m->x[1] + (b2/a0) * m->x[2]
+                            - (a1/a0) * m->y[1] - (a2/a0) * m->y[2]);  // y [z]    
+                m->out_ptr[i] = m->y[0];
+            }
+            else
+                m->out_ptr[i] = m->in_ptr[i] + m->buffer[eco_pos] * *m->level_ptr;
 
             // save output in buffer
             m->buffer[m->sample] = m->out_ptr[i];
+            m->clean_buffer[m->sample] = m->in_ptr[i];
 
             //calculate next sample where we will write in buffer.
             m->sample++;

@@ -37,9 +37,9 @@
             lv2:index 3 ;
             lv2:symbol "delay" ;
             lv2:name "Delay" ;
-            lv2:default 0.05 ;
+            lv2:default 0.01 ;
             lv2:minimum 0.0 ;
-            lv2:maximum 0.1 ;
+            lv2:maximum 0.07 ;
         ] ,
         [
             a lv2:InputPort , lv2:ControlPort ;
