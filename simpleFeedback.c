@@ -40,7 +40,7 @@ typedef struct {
     float* delay_ptr;
     float* attack_ptr;
     float* active_ptr;
-    float* freq_ptr;
+    float* harmonic_ptr;
     float* q_ptr;
 
     double rate;  //sample rate
@@ -91,7 +91,7 @@ static void connect_port (LV2_Handle instance, uint32_t port, void
         m->attack_ptr = (float*) data_location;
         break;
     case 6:
-        m->freq_ptr = (float*) data_location;
+        m->harmonic_ptr = (float*) data_location;
         break;
     case 7:
         m->q_ptr = (float*) data_location;
@@ -155,7 +155,8 @@ static void run (LV2_Handle instance, uint32_t sample_count){
 
             printf("%f \n",m->calc_freq);
             //banpdass biquad filter
-            w0 = 2 * 3.1416 * (m->calc_freq) / m->rate;  // TODO calculate freq
+            //w0 = 2 * 3.1416 * (m->calc_freq) / m->rate;
+            w0 = 2 * 3.1416 * m->calc_freq * *m->harmonic_ptr / m->rate;
             alpha = sin(w0) / (2 * *m->q_ptr);  // TODO define q
             b0 = (1 - cos(w0)) / 2;
             b1 = 1 - cos(w0);
@@ -171,12 +172,13 @@ static void run (LV2_Handle instance, uint32_t sample_count){
         // Bypass: Copy input to output
         for (uint32_t i = 0; i < sample_count; ++i) {
             m->out_ptr[i] = m->in_ptr[i];
+            m->clean_buffer[i] = m->in_ptr[i];
         }
         if (m->prev_active == 1){
             //if before was activated, clear buffer and restart sample position
             for (int i = 0; i < m->rate * BUFFER_SIZE; i++) {
                 m->buffer[i] = 0;
-                m->clean_buffer[i] = 0;
+                //m->clean_buffer[i] = 0;
             }
             m->sample = 0;
             m->prev_active = 0;
@@ -188,17 +190,23 @@ static void run (LV2_Handle instance, uint32_t sample_count){
         uint32_t eco_pos;
         for (uint32_t i = 0; i < sample_count; i++) {
             //calculate which position we must read from buffer.
-            if (m->sample < (*m->delay_ptr * m->rate))
+            //calculo de delay para que matchhe la freq, rate/freq en muestras.
+            //*m->delay_ptr = 1 / m->calc_freq en seg.;
+            /*if (m->sample < (*m->delay_ptr * m->rate))
                 eco_pos = m->sample + m->rate * BUFFER_SIZE - *m->delay_ptr * m->rate;
             else
-                eco_pos = (uint32_t)(m->sample - (*m->delay_ptr * m->rate));
+                eco_pos = (uint32_t)(m->sample - (*m->delay_ptr * m->rate));*/
+            if (m->sample < ( m->rate / m->calc_freq))
+                eco_pos = m->sample + m->rate * BUFFER_SIZE - m->rate / m->calc_freq;
+            else
+                eco_pos = (uint32_t)(m->sample - (m->rate / m->calc_freq));
 
             // output = input + eco
             //m->out_ptr[i] = m->in_ptr[i] + m->buffer[eco_pos] * *m->level_ptr;
             
             
             //output[pos] = m->y[0];
-            if (m->calc_freq < 20000){
+            if (m->calc_freq == 0){
                 //bandpass biquad filter apply
                 m->x[2] = m->x[1]; // x [z-2]
                 m->x[1] = m->x[0]; // x [z-1]
