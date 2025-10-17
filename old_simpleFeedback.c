@@ -30,30 +30,28 @@
 
 #include "stdio.h"
 
-#define BUFFER_TIME 1 // in sec, multiplied by sample_rates gives buffer_size
+#define BUFFER_SIZE 1 // multiplied by sample_rates, 3 -> 3sec.
 
 /* class definition */
 typedef struct {
     float* in_ptr;
     float* out_ptr;
     float* level_ptr;
-    float* delay_ptr;  // not necessary
+    float* delay_ptr;
     float* attack_ptr;
     float* active_ptr;
     float* harmonic_ptr;
 
     double rate;  //sample rate
 
-    float* buffer;  // for recording output signal
-    float* clean_buffer;  // for recording input signal
-    int sample;  // to know where to write in the buffer
+    float* buffer;  // for recording
+    float* clean_buffer;  // for recording
+    int sample;  // to know where to read the buffer
     float calc_freq;
     uint8_t prev_active; // to know if it was activated before or not.
-    int buffer_size;  // BUFFER_TIME * m->rate
-    int delay_pos;
 
-    float x[3];  //filter values  // not necessary
-	float y[3];  //filter values  // not necessary
+    float x[3];  //filter values
+	float y[3];  //filter values
 
 } simpleFeedback;
 
@@ -63,7 +61,6 @@ static LV2_Handle instantiate (const struct LV2_Descriptor *descriptor, double
     simpleFeedback* m = (simpleFeedback*) calloc (1, sizeof (simpleFeedback));
     if(m)
         m->rate = sample_rate;
-        m->buffer_size = BUFFER_TIME * m->rate;
     return m;
 }
 
@@ -84,7 +81,7 @@ static void connect_port (LV2_Handle instance, uint32_t port, void
         m->level_ptr = (float*) data_location;
         break;
     case 3:
-        m->delay_ptr = (float*) data_location;  // not necessary
+        m->delay_ptr = (float*) data_location;
         break;
     case 4:
         m->active_ptr = (float*) data_location;
@@ -103,15 +100,14 @@ static void connect_port (LV2_Handle instance, uint32_t port, void
 static void activate (LV2_Handle instance){
     simpleFeedback* m = (simpleFeedback*) instance;
 
-	m->buffer = malloc(m->buffer_size * sizeof(float));
-    m->clean_buffer = malloc(m->buffer_size * sizeof(float));
-	for (int i = 0; i < m->buffer_size; i++) {
+	m->buffer = malloc(m->rate * BUFFER_SIZE * sizeof(float));
+    m->clean_buffer = malloc(m->rate * BUFFER_SIZE * sizeof(float));
+	for (int i = 0; i < m->rate * BUFFER_SIZE; i++) {
 		m->buffer[i] = 0;
         m->clean_buffer[i] = 0;
 	}
 	m->sample = 0;
     m->calc_freq = 0;
-    m->delay_pos=0;
 
     if(*m->active_ptr < 0.5)
         m->prev_active = 0;
@@ -126,21 +122,47 @@ static void activate (LV2_Handle instance){
 
 static void run (LV2_Handle instance, uint32_t sample_count){
     simpleFeedback* m = (simpleFeedback*) instance;
+    float w0;
+    float alpha;
+    float b0=1;
+    float b1=1;
+    float b2=1;
+    float a0=1;
+    float a1=1;
+    float a2=1;
     float temp_freq = 0;
-    
+    int delay_pos=0;
+    int q = 1;
+
     if (!m) return;
     if ((!m->in_ptr) || (!m->out_ptr) || (!m->level_ptr) || 
         (!m->active_ptr) || (!m->delay_ptr) || (!m->attack_ptr)) return;
 
     if (m->sample > (4 * m->rate / 300)){ //because win_length is rate/300 *2
-        temp_freq = (float) (fft_freq(m->clean_buffer, m->sample, m->buffer_size, m->rate));
-        //temp_freq = (float) (corr_freq(m->clean_buffer, m->sample, m->buffer_size, m->rate));
-        
-        if (temp_freq > 20){
+        temp_freq = (float) (fft_freq(m->clean_buffer, m->sample, BUFFER_SIZE * m->rate, m->rate));
+        //temp_freq = (float) (amdf_freq(m->clean_buffer, m->sample, BUFFER_SIZE * m->rate, m->rate));
+        //temp_freq = (float) (asdf_freq(m->clean_buffer, m->sample, BUFFER_SIZE * m->rate, m->rate));
+        //temp_freq = (float) (acf_freq(m->clean_buffer, m->sample, BUFFER_SIZE * m->rate, m->rate));
+        //temp_freq = 742;
+        //printf("%f \n",temp_freq);
+
+        //if (temp_freq > 1 & (m->calc_freq > 2*temp_freq | m->calc_freq < temp_freq/2)){
+        //if (temp_freq > 1 && temp_freq != m->calc_freq){
+        if (temp_freq > 1 && temp_freq){
             m->calc_freq = temp_freq;
-            m->delay_pos = m->rate / m->calc_freq / *m->harmonic_ptr;  // to match delay with frequency
+            delay_pos = m->rate / m->calc_freq / *m->harmonic_ptr;
 
             printf("%f \n",m->calc_freq);
+            //banpdass biquad filter
+            //w0 = 2 * 3.1416 * (m->calc_freq) / m->rate;
+            w0 = 2 * 3.1416 * m->calc_freq * *m->harmonic_ptr / m->rate;
+            alpha = sin(w0) / (2 * q);  // TODO define q
+            b0 = (1 - cos(w0)) / 2;
+            b1 = 1 - cos(w0);
+            b2 = (1 - cos(w0)) / 2;
+            a0 = 1 + alpha;
+            a1 = -2 * cos(w0);
+            a2 = 1 - alpha;
         }
     }
 
@@ -149,13 +171,13 @@ static void run (LV2_Handle instance, uint32_t sample_count){
         // Bypass: Copy input to output
         for (uint32_t i = 0; i < sample_count; ++i) {
             m->out_ptr[i] = m->in_ptr[i];
-            m->clean_buffer[m->sample] = m->in_ptr[i];
-            m->sample = (m->sample + 1) % (int)(m->buffer_size);
+            m->clean_buffer[i] = m->in_ptr[i];
         }
         if (m->prev_active == 1){
             //if before was activated, clear buffer and restart sample position
-            for (int i = 0; i < m->buffer_size; i++) {
+            for (int i = 0; i < m->rate * BUFFER_SIZE; i++) {
                 m->buffer[i] = 0;
+                //m->clean_buffer[i] = 0;
             }
             m->sample = 0;
             m->prev_active = 0;
@@ -166,20 +188,45 @@ static void run (LV2_Handle instance, uint32_t sample_count){
             m->prev_active = 1;
         uint32_t eco_pos;
         for (uint32_t i = 0; i < sample_count; i++) {
-            //calculate which position we must read from buffer
-            eco_pos = (m->sample - m->delay_pos + m->buffer_size) % m->buffer_size;
-    
-            m->out_ptr[i] = m->in_ptr[i] + m->buffer[eco_pos] * *m->level_ptr;
+            //calculate which position we must read from buffer.
+            //calculo de delay para que matchhe la freq, rate/freq en muestras.
+            //*m->delay_ptr = 1 / m->calc_freq en seg.;
+            /*if (m->sample < (*m->delay_ptr * m->rate))
+                eco_pos = m->sample + m->rate * BUFFER_SIZE - *m->delay_ptr * m->rate;
+            else
+                eco_pos = (uint32_t)(m->sample - (*m->delay_ptr * m->rate));*/
+            if (m->sample < delay_pos)
+                eco_pos = m->sample + m->rate * BUFFER_SIZE - delay_pos;
+            else
+                eco_pos = (uint32_t)(m->sample - delay_pos);
+
+            // output = input + eco
+            //m->out_ptr[i] = m->in_ptr[i] + m->buffer[eco_pos] * *m->level_ptr;
+            
+            
+            //output[pos] = m->y[0];
+            if (m->calc_freq == 0){
+                //bandpass biquad filter apply
+                m->x[2] = m->x[1]; // x [z-2]
+                m->x[1] = m->x[0]; // x [z-1]
+                m->x[0] = m->in_ptr[i] + m->buffer[eco_pos] * *m->level_ptr; // x [z]
+                m->y[2] = m->y[1]; // y [z-2]
+                m->y[1] = m->y[0]; // y [z-1]
+                m->y[0] = ((b0/a0) * m->x[0] + (b1/a0) * m->x[1] + (b2/a0) * m->x[2]
+                            - (a1/a0) * m->y[1] - (a2/a0) * m->y[2]);  // y [z]    
+                m->out_ptr[i] = m->y[0];
+            }
+            else
+                m->out_ptr[i] = m->in_ptr[i] + m->buffer[eco_pos] * *m->level_ptr;
 
             // save output in buffer
             m->buffer[m->sample] = m->out_ptr[i];
             m->clean_buffer[m->sample] = m->in_ptr[i];
 
             //calculate next sample where we will write in buffer.
-            /*m->sample++;
+            m->sample++;
             if (m->sample > m->rate * BUFFER_SIZE)
-                m->sample = 0;*/
-            m->sample = (m->sample + 1) % (int)(m->buffer_size);
+                m->sample = 0;
         }
     }
 }

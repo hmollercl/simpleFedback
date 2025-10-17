@@ -5,18 +5,19 @@
 #include <fftw3.h>
 
 //ajustar variables de input
-/*float detect_fundamental_frequency(float* input, int sample_count, float sample_rate) {
+float corr_freq(float *buffer, int position, int buffer_size, int rate){
+//float corr_freq(float* buffer, int position, float sample_rate) {
     float max_corr = 0.0f;
     int max_index = 0;
 
-    for (int delay = 1; delay < MAX_DELAY; delay++) {
+    for (int delay = 1; delay < buffer_size; delay++) {
         float corr = 0.0f;
-        for (int i = 0; i < sample_count - delay; i++) {
-            corr += input[i] * input[i + delay];
+        for (int i = 0; i < position - delay; i++) {
+            corr += buffer[i] * buffer[i + delay];
         }
 
         // Normaliza la correlación
-        corr /= (sample_count - delay);
+        corr /= (position - delay);
 
         if (corr > max_corr) {
             max_corr = corr;
@@ -25,8 +26,8 @@
     }
 
     // Calcular la frecuencia fundamental
-    return sample_rate / max_index;
-}*/
+    return rate / max_index;
+}
 
 
 float fft_freq(float *buffer, int position, int buffer_size, int rate){
