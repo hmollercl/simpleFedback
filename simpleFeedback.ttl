@@ -35,15 +35,6 @@
         [
             a lv2:InputPort , lv2:ControlPort ;
             lv2:index 3 ;
-            lv2:symbol "delay" ;
-            lv2:name "Delay" ;
-            lv2:default 0.01 ;
-            lv2:minimum 0.0 ;
-            lv2:maximum 0.07 ;
-        ] ,
-        [
-            a lv2:InputPort , lv2:ControlPort ;
-            lv2:index 4 ;
             lv2:symbol "active";
             lv2:name "Active" ;
             lv2:default 0 ;
@@ -52,7 +43,7 @@
         ] ,
         [
             a lv2:InputPort , lv2:ControlPort ;
-            lv2:index 5 ;
+            lv2:index 4 ;
             lv2:symbol "attack" ;
             lv2:name "Attack" ;
             lv2:default 0.1 ;
@@ -61,15 +52,16 @@
         ] ,
         [
             a lv2:InputPort , lv2:ControlPort ;
-            lv2:index 6 ;
+            lv2:index 5 ;
             lv2:symbol "harmonic";
             lv2:name "Harmonic" ;
             lv2:portProperty lv2:integer , lv2:enumeration ;
+            lv2:scalePoint [ rdfs:label "sub" ; rdf:value 0.5 ] ;
             lv2:scalePoint [ rdfs:label "1st" ; rdf:value 1 ] ;
             lv2:scalePoint [ rdfs:label "2nd" ; rdf:value 2 ] ;
             lv2:scalePoint [ rdfs:label "3rd" ; rdf:value 3 ] ;
             lv2:scalePoint [ rdfs:label "5th" ; rdf:value 5 ] ;
             lv2:default 1 ;
-            lv2:minimum 1 ;
+            lv2:minimum 0 ;
             lv2:maximum 5 ;
         ] .

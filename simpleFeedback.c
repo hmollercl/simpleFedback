@@ -37,7 +37,6 @@ typedef struct {
     float* in_ptr;
     float* out_ptr;
     float* level_ptr;
-    float* delay_ptr;  // not necessary
     float* attack_ptr;
     float* active_ptr;
     float* harmonic_ptr;
@@ -84,15 +83,12 @@ static void connect_port (LV2_Handle instance, uint32_t port, void
         m->level_ptr = (float*) data_location;
         break;
     case 3:
-        m->delay_ptr = (float*) data_location;  // not necessary
-        break;
-    case 4:
         m->active_ptr = (float*) data_location;
         break;
-    case 5:
+    case 4:
         m->attack_ptr = (float*) data_location;
         break;
-    case 6:
+    case 5:
         m->harmonic_ptr = (float*) data_location;
         break;
     default:
@@ -130,19 +126,7 @@ static void run (LV2_Handle instance, uint32_t sample_count){
     
     if (!m) return;
     if ((!m->in_ptr) || (!m->out_ptr) || (!m->level_ptr) || 
-        (!m->active_ptr) || (!m->delay_ptr) || (!m->attack_ptr)) return;
-
-    if (m->sample > (4 * m->rate / 300)){ //because win_length is rate/300 *2
-        temp_freq = (float) (fft_freq(m->clean_buffer, m->sample, m->buffer_size, m->rate));
-        //temp_freq = (float) (corr_freq(m->clean_buffer, m->sample, m->buffer_size, m->rate));
-        
-        if (temp_freq > 20){
-            m->calc_freq = temp_freq;
-            m->delay_pos = m->rate / m->calc_freq / *m->harmonic_ptr;  // to match delay with frequency
-
-            printf("%f \n",m->calc_freq);
-        }
-    }
+        (!m->active_ptr) || (!m->harmonic_ptr) || (!m->attack_ptr)) return;
 
     //TODO creo que acá es más simple si no está active escribir 0s.
     if (*m->active_ptr < 0.5) { // or active_state == false if using boolean
@@ -165,6 +149,18 @@ static void run (LV2_Handle instance, uint32_t sample_count){
         if (m->prev_active == 0)
             m->prev_active = 1;
         uint32_t eco_pos;
+        if (m->sample > (4 * m->rate / 300)){ //because win_length is rate/300 *2
+            temp_freq = (float) (fft_freq(m->clean_buffer, m->sample, m->buffer_size, m->rate));
+            //temp_freq = (float) (yin_freq(m->clean_buffer, m->sample, m->buffer_size, m->rate));
+            
+            if (temp_freq > 20){
+                m->calc_freq = temp_freq;
+                m->delay_pos = m->rate / m->calc_freq / *m->harmonic_ptr;  // to match delay with frequency
+
+                printf("%f \n",m->calc_freq);
+            }
+        }
+
         for (uint32_t i = 0; i < sample_count; i++) {
             //calculate which position we must read from buffer
             eco_pos = (m->sample - m->delay_pos + m->buffer_size) % m->buffer_size;

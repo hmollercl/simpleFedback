@@ -33,8 +33,9 @@ float corr_freq(float *buffer, int position, int buffer_size, int rate){
 float fft_freq(float *buffer, int position, int buffer_size, int rate){
     // quizá se debiera reordenar el buffer...
     // Crear el plan FFTW
-    fftwf_complex *out = (fftwf_complex*) fftwf_malloc(sizeof(fftwf_complex) * (buffer_size/2 + 1));
-    fftwf_plan p = fftwf_plan_dft_r2c_1d(buffer_size, buffer, out, FFTW_ESTIMATE);
+    int buffer_part = buffer_size / 10;
+    fftwf_complex *out = (fftwf_complex*) fftwf_malloc(sizeof(fftwf_complex) * (buffer_part + 1));
+    fftwf_plan p = fftwf_plan_dft_r2c_1d(buffer_part, buffer + (buffer_part), out, FFTW_ESTIMATE);
     
     // Realizar la FFT
     fftwf_execute(p);   
@@ -42,7 +43,7 @@ float fft_freq(float *buffer, int position, int buffer_size, int rate){
     double max_amplitude = 0;
     int max_index = 0;
     
-    for (int i = 0; i < buffer_size/2 + 1; i++) {
+    for (int i = 0; i < buffer_part + 1; i++) {
         double amplitude = sqrt(out[i][0] * out[i][0] + out[i][1] * out[i][1]);
         if (amplitude > max_amplitude) {
             max_amplitude = amplitude;
@@ -53,7 +54,7 @@ float fft_freq(float *buffer, int position, int buffer_size, int rate){
     // Liberar recursos
     fftwf_destroy_plan(p);
     fftwf_free(out);
-    return(max_index * rate / buffer_size);
+    return(max_index * rate / buffer_part);
 }
 
 
@@ -161,113 +162,44 @@ float acf_freq(float* buffer, int position, int buffer_size, int rate){
 }
 
 
-
-#ifndef YIN_THRESHOLD
-#define YIN_THRESHOLD 0.10f     // Umbral típico: 0.10–0.15
-#endif
-
-#ifndef YIN_MIN_FREQUENCY
-#define YIN_MIN_FREQUENCY 300.0f // Para guitarra puedes usar 82.0f (E2)
-#endif
-
-#ifndef YIN_MAX_FREQUENCY
-#define YIN_MAX_FREQUENCY 2000.0f
-#endif
-// -------------------------------------------------------------
-
-static inline float yin_parabolic_min_pos(float ym1, float y0, float yp1) {
-    // Devuelve offset submuestral del mínimo (≈ -0.5..0.5)
-    float denom = (ym1 - 2.0f*y0 + yp1);
-    if (fabsf(denom) < 1e-12f) return 0.0f;
-    return 0.5f * (ym1 - yp1) / denom;
-}
-
-// Firma solicitada:
-float yin_freq(float* buffer, int position, int buffer_size, int rate) {
+#define MAX_LAG 300
+#define THRESHOLD 0.1
+float yin_freq(float* buffer, int position, int buffer_size, int rate){
     if (!buffer || buffer_size < 4 || rate <= 0) return 0.0f;
-
-    //const float *x = buffer + position;      // comienzo de la ventana
-    //revisar esto...
-    //const int N = buffer_size;               // largo de la ventana
-    //const float sr = (float)rate;
-    const int N = (int) 1.9 * rate / 300; // 300Hz min freq to look for.
-
-    // Rango de retardos (tau) según min/max freq
-    float maxF = YIN_MAX_FREQUENCY;
-    if (maxF > 0.45f * rate) maxF = 0.45f * rate;     // guardia por Nyquist
-    int tauMin = (int)floorf(rate / maxF);
-    if (tauMin < 1) tauMin = 1;
-    int tauMax = (int)ceilf(rate / YIN_MIN_FREQUENCY);
-
-    // La ventana debe soportar el tau máximo
-    if (tauMax + 1 >= N) {
-        // Ventana demasiado corta para detectar hasta la frecuencia mínima
-        return 0.0f;
-    }
-
-    // Buffers de trabajo
-    float *diff = (float*)malloc((size_t)(tauMax + 1) * sizeof(float));
-    float *cmnd = (float*)malloc((size_t)(tauMax + 1) * sizeof(float));
-    if (!diff || !cmnd) { free(diff); free(cmnd); return 0.0f; }
-
-    // 1) Difference function d(tau)
-    diff[0] = 0.0f;
-    for (int tau = 1; tau <= tauMax; ++tau) {
-        double sum = 0.0;
-        const int limit = N - tau;
-        for (int j = 0; j < limit; ++j) {
-            //const float delta = x[j] - x[j + tau]; // TODO acá cambiar el x por el circular buffer
-            //const float delta = buffer[position - j] - buffer[position - j - tau]; // TODO acá cambiar el x por el circular buffer
-            const float delta = buffer[position - N + j] - buffer[position - N + j + tau]; // TODO acá cambiar el x por el circular buffer
-            sum += (double)delta * (double)delta;
+    float difference[MAX_LAG] = {0};
+    float cumulative[MAX_LAG] = {0};
+    int tau, i;
+    
+    // Paso 1: Función de diferencia
+    for (tau = 1; tau < MAX_LAG; tau++) {
+        for (i = 0; i < buffer_size - tau; i++) {
+            float diff = buffer[i] - buffer[i + tau];
+            difference[tau] += diff * diff;
         }
-        diff[tau] = (float)sum;
+        difference[tau] /= (buffer_size - tau);
     }
-
-    // 2) CMND d'(tau) = d(tau) / ( (1/tau) * sum_{j=1..tau} d(j) )
-    cmnd[0] = 1.0f;
-    double acc = 0.0;
-    for (int tau = 1; tau <= tauMax; ++tau) {
-        acc += (double)diff[tau];
-        cmnd[tau] = (acc == 0.0) ? 1.0f : (diff[tau] * (float)((double)tau / acc));
+    
+    // Paso 2: Función acumulativa
+    cumulative[0] = 1.0;
+    float sum = 0.0;
+    for (tau = 1; tau < MAX_LAG; tau++) {
+        sum += difference[tau];
+        cumulative[tau] = difference[tau] / (sum / tau);
     }
-
-    // 3) Buscar primer tau por debajo del umbral y avanzar al mínimo local
-    const float thresh = YIN_THRESHOLD;
-    int tau = -1;
-    for (int t = tauMin; t <= tauMax; ++t) {
-        if (cmnd[t] < thresh) {
-            while (t + 1 <= tauMax && cmnd[t + 1] < cmnd[t]) ++t;
-            tau = t;
+    
+    // Paso 3: Buscar el mínimo por debajo del umbral
+    int min_tau = -1;
+    for (tau = 2; tau < MAX_LAG; tau++) {
+        if (cumulative[tau] < THRESHOLD) {
+            min_tau = tau;
             break;
         }
     }
-
-    // Fallback: si nunca cruza el umbral, usar el mínimo global en el rango
-    if (tau < 0) {
-        float best = FLT_MAX;
-        int bestT = -1;
-        for (int t = tauMin; t <= tauMax; ++t) {
-            if (cmnd[t] < best) { best = cmnd[t]; bestT = t; }
-        }
-        tau = bestT;
-        if (tau < 0) { free(diff); free(cmnd); return 0.0f; }
-        // Si la “confianza” es muy baja, puedes decidir devolver 0:
-        // if (best > 0.9f) { free(diff); free(cmnd); return 0.0f; }
-    }
-
-    // 4) Interpolación parabólica alrededor del mínimo en CMND
-    const float ym1 = (tau - 1 >= 1) ? cmnd[tau - 1] : cmnd[tau];
-    const float y0  = cmnd[tau];
-    const float yp1 = (tau + 1 <= tauMax) ? cmnd[tau + 1] : cmnd[tau];
-    float offset = yin_parabolic_min_pos(ym1, y0, yp1);
-    if (offset > 1.0f)  offset = 1.0f;
-    if (offset < -1.0f) offset = -1.0f;
-
-    const float tau_refined = (float)tau + offset;
-    const float freq = (tau_refined > 0.0f) ? (rate / tau_refined) : 0.0f;
-
-    free(diff);
-    free(cmnd);
-    return (freq > 0.0f) ? freq : 0.0f;
+    
+    // Paso 4: Convertir a frecuencia
+    if (min_tau != -1) {
+        return rate / min_tau;
+    } else {
+        return 0.0; // No se detectó pitch
+    } 
 }
