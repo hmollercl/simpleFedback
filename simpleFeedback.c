@@ -31,6 +31,7 @@
 #include "stdio.h"
 
 #define BUFFER_TIME 1 // in sec, multiplied by sample_rates gives buffer_size
+#define MIN_FREQ 300
 
 /* class definition */
 typedef struct {
@@ -149,15 +150,17 @@ static void run (LV2_Handle instance, uint32_t sample_count){
         if (m->prev_active == 0)
             m->prev_active = 1;
         uint32_t eco_pos;
-        if (m->sample > (4 * m->rate / 300)){ //because win_length is rate/300 *2
-            temp_freq = (float) (fft_freq(m->clean_buffer, m->sample, m->buffer_size, m->rate));
+        if (m->sample > (4 * m->rate / 300)){ //because min_win_length is rate/300 *2 for 300Hz min freq.
+            //temp_freq = (float) (fft_freq(m->clean_buffer, m->sample, m->buffer_size, m->rate));
+            temp_freq = (float) (fft_autocorr_freq(m->clean_buffer, m->sample, m->buffer_size, m->rate));
             //temp_freq = (float) (yin_freq(m->clean_buffer, m->sample, m->buffer_size, m->rate));
+            printf("%f \n",temp_freq);
             
             if (temp_freq > 20){
                 m->calc_freq = temp_freq;
                 m->delay_pos = m->rate / m->calc_freq / *m->harmonic_ptr;  // to match delay with frequency
 
-                printf("%f \n",m->calc_freq);
+                //printf("%f \n",m->calc_freq);
             }
         }
 

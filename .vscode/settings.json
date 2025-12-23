@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "fftw3.h": "c",
+        "string.h": "c"
+    }
+}
