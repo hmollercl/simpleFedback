@@ -32,6 +32,7 @@
 
 #define BUFFER_TIME 1 // in sec, multiplied by sample_rates gives buffer_size
 #define MIN_FREQ 300
+//#define DEBUG  // se supone que lo puse en el makefile y no es necesario
 
 /* class definition */
 typedef struct {
@@ -52,18 +53,39 @@ typedef struct {
     int buffer_size;  // BUFFER_TIME * m->rate
     int delay_pos;
 
-    float x[3];  //filter values  // not necessary
-	float y[3];  //filter values  // not necessary
-
 } simpleFeedback;
 
 /* internal core methods */
 static LV2_Handle instantiate (const struct LV2_Descriptor *descriptor, double
     sample_rate, const char *bundle_path, const LV2_Feature *const *features){
-    simpleFeedback* m = (simpleFeedback*) calloc (1, sizeof (simpleFeedback));
-    if(m)
-        m->rate = sample_rate;
-        m->buffer_size = BUFFER_TIME * m->rate;
+    simpleFeedback* m = (simpleFeedback*)calloc(1, sizeof(simpleFeedback));
+    if (!m) {
+        return NULL;
+    }
+
+    m->rate        = sample_rate;
+    m->buffer_size = (uint32_t)(BUFFER_TIME * sample_rate);
+
+    if (m->buffer_size == 0) {
+        free(m);
+        return NULL;
+    }
+
+    m->buffer = (float*)calloc(m->buffer_size, sizeof(float));
+    m->clean_buffer = (float*)calloc(m->buffer_size, sizeof(float));
+
+    if (!m->buffer || !m->clean_buffer) {
+        free(m->buffer);
+        free(m->clean_buffer);
+        free(m);
+        return NULL;
+    }
+
+    m->sample     = 0;
+    m->calc_freq  = 0.0f;
+    m->delay_pos  = 0;
+    m->prev_active = 0;
+
     return m;
 }
 
@@ -98,124 +120,163 @@ static void connect_port (LV2_Handle instance, uint32_t port, void
 }
 
 static void activate (LV2_Handle instance){
-    simpleFeedback* m = (simpleFeedback*) instance;
-
-	m->buffer = malloc(m->buffer_size * sizeof(float));
-    m->clean_buffer = malloc(m->buffer_size * sizeof(float));
-	for (int i = 0; i < m->buffer_size; i++) {
+simpleFeedback* m = (simpleFeedback*)instance;
+    if (!m) return;
+    
+    /*for (int i = 0; i < m->buffer_size; i++) {
 		m->buffer[i] = 0;
         m->clean_buffer[i] = 0;
-	}
-	m->sample = 0;
-    m->calc_freq = 0;
-    m->delay_pos=0;
+	}*/
+    if (m->buffer && m->clean_buffer && m->buffer_size > 0) {
+        memset(m->buffer,       0, m->buffer_size * sizeof(float));
+        memset(m->clean_buffer, 0, m->buffer_size * sizeof(float));
+    }
 
-    if(*m->active_ptr < 0.5)
+    m->sample    = 0;
+    m->calc_freq = 0.0f;
+    m->delay_pos = 0;
+
+    if (m->active_ptr && *m->active_ptr < 0.5f)
         m->prev_active = 0;
     else
         m->prev_active = 1;
 
-    for (int i = 0; i < 3; i++) {
-		m->x[i] = 0;
-		m->y[i] = 0;
-	}
+    /* Para evitar warning si attack_ptr aún no se usa */
+    (void)m->attack_ptr;
 }
 
-static void run (LV2_Handle instance, uint32_t sample_count){
-    simpleFeedback* m = (simpleFeedback*) instance;
-    float temp_freq = 0;
-    
+static void run(LV2_Handle instance, uint32_t sample_count)
+{
+    simpleFeedback* m = (simpleFeedback*)instance;
     if (!m) return;
-    if ((!m->in_ptr) || (!m->out_ptr) || (!m->level_ptr) || 
-        (!m->active_ptr) || (!m->harmonic_ptr) || (!m->attack_ptr)) return;
 
-    //TODO creo que acá es más simple si no está active escribir 0s.
-    if (*m->active_ptr < 0.5) { // or active_state == false if using boolean
-        // Bypass: Copy input to output
+    if ((!m->in_ptr) || (!m->out_ptr) || (!m->level_ptr) ||
+        (!m->active_ptr) || (!m->harmonic_ptr) || (!m->attack_ptr) ||
+        (!m->buffer) || (!m->clean_buffer) || (m->buffer_size == 0)) {
+        return;
+    }
+
+    float temp_freq = 0.0f;
+    const uint32_t buf_size = m->buffer_size;  // dado que se ocupa muchas veces es más rápido leer la memoria que el puntero. Además al saber el compilador q la variable no cambia puede introducir optimizaciones.
+
+    if (*m->active_ptr < 0.5f) {
+        /* Bypass + guardado de clean_buffer */
         for (uint32_t i = 0; i < sample_count; ++i) {
             m->out_ptr[i] = m->in_ptr[i];
             m->clean_buffer[m->sample] = m->in_ptr[i];
-            m->sample = (m->sample + 1) % (int)(m->buffer_size);
+            m->sample = (m->sample + 1U) % buf_size;  // como m->sample es uint, le ponemos U al 1 para que sea unsigned.
         }
-        if (m->prev_active == 1){
-            //if before was activated, clear buffer and restart sample position
-            for (int i = 0; i < m->buffer_size; i++) {
-                m->buffer[i] = 0;
+
+        if (m->prev_active == 1) {
+            /* Si antes estaba activo, vaciar buffer y resetear índice */
+            for (uint32_t i = 0; i < buf_size; ++i) {
+                m->buffer[i] = 0.0f;
             }
             m->sample = 0;
             m->prev_active = 0;
         }
+        return;
     }
-    else{
-        if (m->prev_active == 0)
-            m->prev_active = 1;
-        uint32_t eco_pos;
-        if (m->sample > (4 * m->rate / 300)){ //because min_win_length is rate/300 *2 for 300Hz min freq.
-            //temp_freq = (float) (fft_freq(m->clean_buffer, m->sample, m->buffer_size, m->rate));
-            temp_freq = (float) (fft_autocorr_freq(m->clean_buffer, m->sample, m->buffer_size, m->rate));
-            //temp_freq = (float) (yin_freq(m->clean_buffer, m->sample, m->buffer_size, m->rate));
-            printf("%f \n",temp_freq);
-            
-            if (temp_freq > 20){
-                m->calc_freq = temp_freq;
-                m->delay_pos = m->rate / m->calc_freq / *m->harmonic_ptr;  // to match delay with frequency
 
-                //printf("%f \n",m->calc_freq);
+    /* Estado activo */
+    if (m->prev_active == 0) {
+        m->prev_active = 1;
+    }
+
+    /* Solo recalculamos frecuencia si tenemos una ventana mínima */
+    const uint32_t min_samples = (uint32_t)(4.0 * m->rate / (double)MIN_FREQ);
+    if (m->sample > min_samples) {
+        temp_freq = (float)fft_autocorr_freq(
+            m->clean_buffer, m->sample, buf_size, m->rate);
+
+        if (temp_freq > 20.0f) {
+            m->calc_freq = temp_freq;
+
+            /* Proteger harmonic_ptr por si el host manda 0 */
+            float harmonic = (*m->harmonic_ptr > 0.01f) ? *m->harmonic_ptr : 1.0f;
+
+            double delay = m->rate / (double)m->calc_freq / (double)harmonic;
+            if (delay < 1.0) {
+                delay = 1.0;
             }
+            if (delay > buf_size - 1) {
+                delay = buf_size - 1;
+            }
+
+            m->delay_pos = (uint32_t)delay;
+
+            /* No hacer printf en tiempo real */
+            /* printf("%f\n", m->calc_freq); */
+            #ifdef DEBUG
+            log_msg(m, m->log_Notice, "freq=%f\n", m->calc_freq);
+            #endif
         }
+    }
 
-        for (uint32_t i = 0; i < sample_count; i++) {
-            //calculate which position we must read from buffer
-            eco_pos = (m->sample - m->delay_pos + m->buffer_size) % m->buffer_size;
-    
-            m->out_ptr[i] = m->in_ptr[i] + m->buffer[eco_pos] * *m->level_ptr;
+    for (uint32_t i = 0; i < sample_count; ++i) {
+        //calculate which position we must read from buffer
+        uint32_t eco_pos = (m->sample + buf_size - m->delay_pos) % buf_size;
 
-            // save output in buffer
-            m->buffer[m->sample] = m->out_ptr[i];
-            m->clean_buffer[m->sample] = m->in_ptr[i];
+        float delayed = m->buffer[eco_pos];
+        float in      = m->in_ptr[i];
 
-            //calculate next sample where we will write in buffer.
-            /*m->sample++;
-            if (m->sample > m->rate * BUFFER_SIZE)
-                m->sample = 0;*/
-            m->sample = (m->sample + 1) % (int)(m->buffer_size);
-        }
+        m->out_ptr[i] = in + delayed * (*m->level_ptr);
+
+        /* Guardamos señal con feedback en buffer, y la señal limpia en clean_buffer */
+        m->buffer[m->sample]       = in + delayed;
+        m->clean_buffer[m->sample] = in;
+
+        m->sample = (m->sample + 1U) % buf_size;
     }
 }
 
-static void deactivate (LV2_Handle instance)
+static void deactivate(LV2_Handle instance)
 {
-    /* not needed here */
+    /* En este diseño no liberamos nada aquí
+       (los buffers se mantienen hasta cleanup).
+       Importante: no hacer free en un posible contexto RT. */
+    (void)instance;
 }
 
-static void cleanup (LV2_Handle instance)
+static void cleanup(LV2_Handle instance)
 {
-    simpleFeedback* m = (simpleFeedback*) instance;
+    simpleFeedback* m = (simpleFeedback*)instance;
     if (!m) return;
-    free (m);
+
+    if (m->buffer) {
+        free(m->buffer);
+        m->buffer = NULL;
+    }
+    if (m->clean_buffer) {
+        free(m->clean_buffer);
+        m->clean_buffer = NULL;
+    }
+
+    free(m);
 }
 
-static const void* extension_data (const char *uri)
+static const void* extension_data(const char* uri)
 {
+    (void)uri;
     return NULL;
 }
 
 /* descriptor */
-static LV2_Descriptor const descriptor =
-{
+static const LV2_Descriptor descriptor = {
     "https://github.com/hmollercl/simpleFeedback",
     instantiate,
     connect_port,
-    activate /* or NULL */,
+    activate,
     run,
-    deactivate /* or NULL */,
+    deactivate,
     cleanup,
-    extension_data /* or NULL */
+    extension_data
 };
 
-/* interface */
-const LV2_SYMBOL_EXPORT LV2_Descriptor* lv2_descriptor (uint32_t index)
+LV2_SYMBOL_EXPORT const LV2_Descriptor* lv2_descriptor(uint32_t index)
 {
-    if (index == 0) return &descriptor;
-    else return NULL;
+    if (index == 0) {
+        return &descriptor;
+    }
+    return NULL;
 }
