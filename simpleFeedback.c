@@ -24,15 +24,16 @@
 //#include "stddef.h"
 #include "stdint.h"
 #include "stdlib.h"
+#include "string.h"
 #include "math.h"
 #include "lv2.h"
 #include "freq_calc.h"
 
-#include "stdio.h"
+//#include "stdio.h"
 
 #define BUFFER_TIME 1 // in sec, multiplied by sample_rates gives buffer_size
 #define MIN_FREQ 300
-//#define DEBUG  // se supone que lo puse en el makefile y no es necesario
+//#define DEBUG  // in makefile
 
 /* class definition */
 typedef struct {
@@ -208,7 +209,7 @@ static void run(LV2_Handle instance, uint32_t sample_count)
             /* No hacer printf en tiempo real */
             /* printf("%f\n", m->calc_freq); */
             #ifdef DEBUG
-            log_msg(m, m->log_Notice, "freq=%f\n", m->calc_freq);
+            printf("%f\n", m->calc_freq);
             #endif
         }
     }
