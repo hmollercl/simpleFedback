@@ -91,12 +91,24 @@ autocorr_freq_rt(simpleFeedback* m,
     }
 
     int idx = start;
+    float sumsq = 0.0f;  //for RMS calc
     for (int i = 0; i < N; ++i) {
         m->pd_time[i] = buffer[idx];
+        float x = buffer[idx];
+        sumsq += x * x;
         idx++;
         if (idx >= buffer_size) {
             idx = 0;
         }
+    }
+
+    float rms = sqrtf(sumsq / (float)N);
+
+    // Umbral mínimo de RMS (ajustable)
+    const float RMS_MIN = 0.001f;   // prueba con 0.001–0.005
+    if (rms < RMS_MIN) {
+        // Señal demasiado débil → no actualizar pitch
+        return 0.0f;
     }
 
     // === 2. FFT (forward) ===
@@ -117,6 +129,12 @@ autocorr_freq_rt(simpleFeedback* m,
     // === 5. Normalizar autocorrelación ===
     for (int i = 0; i < N; ++i) {
         m->pd_autocorr[i] /= (float)N;
+    }
+
+    // Energía en tau = 0
+    float r0 = m->pd_autocorr[0];
+    if (r0 <= 1e-9f) {
+        return 0.0f;
     }
 
     // === 6. Buscar lag en rango [lag_min, lag_max] ===
@@ -144,14 +162,31 @@ autocorr_freq_rt(simpleFeedback* m,
         return 0.0f;
     }
 
-    // === 7. Convertir lag a frecuencia ===
+    // === 7. Evaluar calidad del pico (normalizado) ===
+    float norm_peak = max_val / r0;
+
+    // Umbral de "periodicidad" (ajustable: 0.2–0.4 suelen ir bien)
+    const float CORR_MIN = 0.25f;
+
+    if (norm_peak < CORR_MIN) {
+        // Pico de autocorrelación débil → probablemente ruido / sin pitch claro
+        return 0.0f;
+    }
+
+    // === 8. Lag → frecuencia ===
     float freq = (float)m->rate / (float)max_lag;
-
-    // (Opcional) puedes hacer un pequeño suavizado aquí usando m->calc_freq previo:
-    // float alpha = 0.3f;
-    // freq = alpha * freq + (1.0f - alpha) * m->calc_freq;
-
     return freq;
+
+
+    /*Cómo ajustar los umbrales en la práctica
+    RMS_MIN:
+    Empieza con algo bajo, tipo 0.001 o 0.002.
+    Si sigue actualizando pitch en colas muy débiles → súbelo un poco.
+
+    CORR_MIN:
+    Empieza con 0.25.
+    Si te da muchos falsos pitches con ruido → sube a 0.3–0.35.
+    Si se vuelve demasiado “perezoso” para detectar notas suaves → bájalo a 0.2.*/
 }
 
 
@@ -320,15 +355,19 @@ static void run(LV2_Handle instance, uint32_t sample_count)
     /* Solo recalculamos frecuencia si tenemos una ventana mínima */
     const uint32_t min_samples = (uint32_t)(4.0 * m->rate / (double)MIN_FREQ);
     if (m->sample > min_samples) {
-        /*temp_freq = (float)fft_autocorr_freq(
-            m->clean_buffer, m->sample, buf_size, m->rate);*/
         temp_freq = (float)autocorr_freq_rt(m,
                                        m->clean_buffer,
                                        m->sample,
                                        m->buffer_size);
 
-        if (temp_freq > 20.0f) {
-            m->calc_freq = temp_freq;
+        if (temp_freq > 0.0f) {
+            // Hay un pitch confiable → actualiza, idealmente con suavizado
+            const float alpha = 0.3f; // 0 = ultra suave, 1 = sin suavizado
+            if (m->calc_freq <= 0.0f) {
+                m->calc_freq = temp_freq;
+            } else {
+                m->calc_freq = alpha * temp_freq + (1.0f - alpha) * m->calc_freq;
+            }
 
             /* Proteger harmonic_ptr por si el host manda 0 */
             /*float harmonic = (*m->harmonic_ptr > 0.01f) ? *m->harmonic_ptr : 1.0f;
@@ -342,9 +381,6 @@ static void run(LV2_Handle instance, uint32_t sample_count)
             }
 
             m->delay_pos = (uint32_t)delay;*/
-
-            float alpha = 0.3f;
-            m->calc_freq = alpha * temp_freq + (1.0f - alpha) * m->calc_freq;
 
             m->delay_pos = (uint32_t)(m->rate / (m->calc_freq * (*m->harmonic_ptr > 0.01f ? *m->harmonic_ptr : 1.0f)));
 
