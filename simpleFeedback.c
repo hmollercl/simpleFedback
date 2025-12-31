@@ -27,9 +27,16 @@
 #include "string.h"
 #include "math.h"
 #include "lv2.h"
-#include "freq_calc.h"
+//#include "freq_calc.h"
 
-//#include "stdio.h"
+#include "math.h"
+#include <sys/types.h>
+#include <float.h>
+#include <fftw3.h>
+#define F_MIN 300.0f     // Hz (Mi2 ~82 Hz, nota más baja)
+#define F_MAX 1200.0f    // Hz (trastes altos, agudos)
+#define FFT_SIZE 16384   // tamaño de la ventana para calcular fft
+
 
 #define BUFFER_TIME 1 // in sec, multiplied by sample_rates gives buffer_size
 #define MIN_FREQ 300
@@ -54,7 +61,99 @@ typedef struct {
     int buffer_size;  // BUFFER_TIME * m->rate
     int delay_pos;
 
+    // === Pitch detection (autocorrelación) ===
+    float*          pd_time;      // buffer de entrada para la FFT (FFT_SIZE)
+    fftwf_complex*  pd_freq;      // salida FFT compleja (FFT_SIZE/2+1)
+    float*          pd_autocorr;  // autocorrelación (FFT_SIZE)
+    fftwf_plan      pd_plan_fwd;  // plan FFT r2c
+    fftwf_plan      pd_plan_inv;  // plan IFFT c2r
+
 } simpleFeedback;
+
+static float
+autocorr_freq_rt(simpleFeedback* m,
+                 const float*    buffer,
+                 int             position,
+                 int             buffer_size)
+{
+    if (!m || !buffer || buffer_size <= 0) {
+        return 0.0f;
+    }
+
+    const int N = FFT_SIZE;
+
+    // === 1. Copiar N muestras del buffer circular a m->pd_time ===
+    // Suponemos que 'position' es la próxima posición de escritura,
+    // y que los datos válidos son los N samples anteriores.
+    int start = position - N;
+    while (start < 0) {
+        start += buffer_size;
+    }
+
+    int idx = start;
+    for (int i = 0; i < N; ++i) {
+        m->pd_time[i] = buffer[idx];
+        idx++;
+        if (idx >= buffer_size) {
+            idx = 0;
+        }
+    }
+
+    // === 2. FFT (forward) ===
+    fftwf_execute(m->pd_plan_fwd);
+
+    // === 3. Espectro de potencia: |X(f)|^2 ===
+    int spec_size = N / 2 + 1;
+    for (int i = 0; i < spec_size; ++i) {
+        float re = m->pd_freq[i][0];
+        float im = m->pd_freq[i][1];
+        m->pd_freq[i][0] = re * re + im * im; // potencia real
+        m->pd_freq[i][1] = 0.0f;              // parte imaginaria = 0
+    }
+
+    // === 4. IFFT → autocorrelación ===
+    fftwf_execute(m->pd_plan_inv);
+
+    // === 5. Normalizar autocorrelación ===
+    for (int i = 0; i < N; ++i) {
+        m->pd_autocorr[i] /= (float)N;
+    }
+
+    // === 6. Buscar lag en rango [lag_min, lag_max] ===
+    int lag_min = (int)(m->rate / F_MAX);  // lag mínimo (freq más alta)
+    int lag_max = (int)(m->rate / F_MIN);  // lag máximo (freq más baja)
+
+    if (lag_min < 1) lag_min = 1;
+    if (lag_max >= N) lag_max = N - 1;
+    if (lag_min >= lag_max) {
+        return 0.0f;
+    }
+
+    float max_val = -1.0e30f;
+    int   max_lag = lag_min;
+
+    for (int lag = lag_min; lag <= lag_max; ++lag) {
+        float v = m->pd_autocorr[lag];
+        if (v > max_val) {
+            max_val = v;
+            max_lag = lag;
+        }
+    }
+
+    if (max_lag <= 0) {
+        return 0.0f;
+    }
+
+    // === 7. Convertir lag a frecuencia ===
+    float freq = (float)m->rate / (float)max_lag;
+
+    // (Opcional) puedes hacer un pequeño suavizado aquí usando m->calc_freq previo:
+    // float alpha = 0.3f;
+    // freq = alpha * freq + (1.0f - alpha) * m->calc_freq;
+
+    return freq;
+}
+
 
 /* internal core methods */
 static LV2_Handle instantiate (const struct LV2_Descriptor *descriptor, double
@@ -82,6 +181,40 @@ static LV2_Handle instantiate (const struct LV2_Descriptor *descriptor, double
         return NULL;
     }
 
+    // ==== Pitch detection: reservar memoria FFTW ====
+    m->pd_time = (float*)fftwf_malloc(sizeof(float) * FFT_SIZE);
+    m->pd_freq = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * (FFT_SIZE/2 + 1));
+    m->pd_autocorr = (float*)fftwf_malloc(sizeof(float) * FFT_SIZE);
+
+    if (!m->pd_time || !m->pd_freq || !m->pd_autocorr) {
+        if (m->pd_time) fftwf_free(m->pd_time);
+        if (m->pd_freq) fftwf_free(m->pd_freq);
+        if (m->pd_autocorr) fftwf_free(m->pd_autocorr);
+        free(m->buffer);
+        free(m->clean_buffer);
+        free(m);
+        return NULL;
+    }
+
+    // ==== Crear planes FFTW (no-RT, aquí sí se puede usar MEASURE) ====
+    m->pd_plan_fwd = fftwf_plan_dft_r2c_1d(
+        FFT_SIZE, m->pd_time, m->pd_freq, FFTW_MEASURE);
+    m->pd_plan_inv = fftwf_plan_dft_c2r_1d(
+        FFT_SIZE, m->pd_freq, m->pd_autocorr, FFTW_MEASURE);
+
+    if (!m->pd_plan_fwd || !m->pd_plan_inv) {
+        if (m->pd_plan_fwd) fftwf_destroy_plan(m->pd_plan_fwd);
+        if (m->pd_plan_inv) fftwf_destroy_plan(m->pd_plan_inv);
+        fftwf_free(m->pd_time);
+        fftwf_free(m->pd_freq);
+        fftwf_free(m->pd_autocorr);
+        free(m->buffer);
+        free(m->clean_buffer);
+        free(m);
+        return NULL;
+    }
+
+    //inicializar non GTP
     m->sample     = 0;
     m->calc_freq  = 0.0f;
     m->delay_pos  = 0;
@@ -187,14 +320,18 @@ static void run(LV2_Handle instance, uint32_t sample_count)
     /* Solo recalculamos frecuencia si tenemos una ventana mínima */
     const uint32_t min_samples = (uint32_t)(4.0 * m->rate / (double)MIN_FREQ);
     if (m->sample > min_samples) {
-        temp_freq = (float)fft_autocorr_freq(
-            m->clean_buffer, m->sample, buf_size, m->rate);
+        /*temp_freq = (float)fft_autocorr_freq(
+            m->clean_buffer, m->sample, buf_size, m->rate);*/
+        temp_freq = (float)autocorr_freq_rt(m,
+                                       m->clean_buffer,
+                                       m->sample,
+                                       m->buffer_size);
 
         if (temp_freq > 20.0f) {
             m->calc_freq = temp_freq;
 
             /* Proteger harmonic_ptr por si el host manda 0 */
-            float harmonic = (*m->harmonic_ptr > 0.01f) ? *m->harmonic_ptr : 1.0f;
+            /*float harmonic = (*m->harmonic_ptr > 0.01f) ? *m->harmonic_ptr : 1.0f;
 
             double delay = m->rate / (double)m->calc_freq / (double)harmonic;
             if (delay < 1.0) {
@@ -204,7 +341,12 @@ static void run(LV2_Handle instance, uint32_t sample_count)
                 delay = buf_size - 1;
             }
 
-            m->delay_pos = (uint32_t)delay;
+            m->delay_pos = (uint32_t)delay;*/
+
+            float alpha = 0.3f;
+            m->calc_freq = alpha * temp_freq + (1.0f - alpha) * m->calc_freq;
+
+            m->delay_pos = (uint32_t)(m->rate / (m->calc_freq * (*m->harmonic_ptr > 0.01f ? *m->harmonic_ptr : 1.0f)));
 
             /* No hacer printf en tiempo real */
             /* printf("%f\n", m->calc_freq); */
@@ -251,6 +393,29 @@ static void cleanup(LV2_Handle instance)
     if (m->clean_buffer) {
         free(m->clean_buffer);
         m->clean_buffer = NULL;
+    }
+
+    // Pitch detection (FFTW)
+    if (m->pd_plan_fwd) {
+        fftwf_destroy_plan(m->pd_plan_fwd);
+        m->pd_plan_fwd = NULL;
+    }
+    if (m->pd_plan_inv) {
+        fftwf_destroy_plan(m->pd_plan_inv);
+        m->pd_plan_inv = NULL;
+    }
+
+    if (m->pd_time) {
+        fftwf_free(m->pd_time);
+        m->pd_time = NULL;
+    }
+    if (m->pd_freq) {
+        fftwf_free(m->pd_freq);
+        m->pd_freq = NULL;
+    }
+    if (m->pd_autocorr) {
+        fftwf_free(m->pd_autocorr);
+        m->pd_autocorr = NULL;
     }
 
     free(m);

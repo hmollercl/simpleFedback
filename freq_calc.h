@@ -3,8 +3,97 @@
 #include <float.h>
 #include <fftw3.h>
 
-#define F_MIN 300     // Hz (Mi2 ~82 Hz, nota más baja)
-#define F_MAX 1200    // Hz (trastes altos, agudos)
+#define F_MIN 300.0f     // Hz (Mi2 ~82 Hz, nota más baja)
+#define F_MAX 1200.0f    // Hz (trastes altos, agudos)
+#define FFT_SIZE 16384   // tamaño de la ventana para calcular fft
+
+
+
+// RT-safe: NO malloc, NO printf, NO creación/destrucción de planes.
+static float
+autocorr_freq_rt(simpleFeedback* m,
+                 const float*    buffer,
+                 int             position,
+                 int             buffer_size)
+{
+    if (!m || !buffer || buffer_size <= 0) {
+        return 0.0f;
+    }
+
+    const int N = FFT_SIZE;
+
+    // === 1. Copiar N muestras del buffer circular a m->pd_time ===
+    // Suponemos que 'position' es la próxima posición de escritura,
+    // y que los datos válidos son los N samples anteriores.
+    int start = position - N;
+    while (start < 0) {
+        start += buffer_size;
+    }
+
+    int idx = start;
+    for (int i = 0; i < N; ++i) {
+        m->pd_time[i] = buffer[idx];
+        idx++;
+        if (idx >= buffer_size) {
+            idx = 0;
+        }
+    }
+
+    // === 2. FFT (forward) ===
+    fftwf_execute(m->pd_plan_fwd);
+
+    // === 3. Espectro de potencia: |X(f)|^2 ===
+    int spec_size = N / 2 + 1;
+    for (int i = 0; i < spec_size; ++i) {
+        float re = m->pd_freq[i][0];
+        float im = m->pd_freq[i][1];
+        m->pd_freq[i][0] = re * re + im * im; // potencia real
+        m->pd_freq[i][1] = 0.0f;              // parte imaginaria = 0
+    }
+
+    // === 4. IFFT → autocorrelación ===
+    fftwf_execute(m->pd_plan_inv);
+
+    // === 5. Normalizar autocorrelación ===
+    for (int i = 0; i < N; ++i) {
+        m->pd_autocorr[i] /= (float)N;
+    }
+
+    // === 6. Buscar lag en rango [lag_min, lag_max] ===
+    int lag_min = (int)(m->rate / F_MAX);  // lag mínimo (freq más alta)
+    int lag_max = (int)(m->rate / F_MIN);  // lag máximo (freq más baja)
+
+    if (lag_min < 1) lag_min = 1;
+    if (lag_max >= N) lag_max = N - 1;
+    if (lag_min >= lag_max) {
+        return 0.0f;
+    }
+
+    float max_val = -1.0e30f;
+    int   max_lag = lag_min;
+
+    for (int lag = lag_min; lag <= lag_max; ++lag) {
+        float v = m->pd_autocorr[lag];
+        if (v > max_val) {
+            max_val = v;
+            max_lag = lag;
+        }
+    }
+
+    if (max_lag <= 0) {
+        return 0.0f;
+    }
+
+    // === 7. Convertir lag a frecuencia ===
+    float freq = (float)m->rate / (float)max_lag;
+
+    // (Opcional) puedes hacer un pequeño suavizado aquí usando m->calc_freq previo:
+    // float alpha = 0.3f;
+    // freq = alpha * freq + (1.0f - alpha) * m->calc_freq;
+
+    return freq;
+}
+
 
 // Función autocorrelacionada mejorada:
 float fft_autocorr_freq(float *buffer, int position, int buffer_size, int rate) {
