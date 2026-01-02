@@ -60,6 +60,7 @@ typedef struct {
     uint8_t prev_active; // to know if it was activated before or not.
     int buffer_size;  // BUFFER_TIME * m->rate
     int delay_pos;
+    float effect_gain;   // ganancia “suavizada” del efecto, para usar attack_ptr
 
     // === Pitch detection (autocorrelación) ===
     float*          pd_time;      // buffer de entrada para la FFT (FFT_SIZE)
@@ -104,10 +105,9 @@ autocorr_freq_rt(simpleFeedback* m,
 
     float rms = sqrtf(sumsq / (float)N);
 
-    // Umbral mínimo de RMS (ajustable)
-    const float RMS_MIN = 0.001f;   // prueba con 0.001–0.005
+    // mín RMS (adjustable)
+    const float RMS_MIN = 0.001f;   // to use between 0.001–0.005
     if (rms < RMS_MIN) {
-        // Señal demasiado débil → no actualizar pitch
         return 0.0f;
     }
 
@@ -119,11 +119,11 @@ autocorr_freq_rt(simpleFeedback* m,
     for (int i = 0; i < spec_size; ++i) {
         float re = m->pd_freq[i][0];
         float im = m->pd_freq[i][1];
-        m->pd_freq[i][0] = re * re + im * im; // potencia real
-        m->pd_freq[i][1] = 0.0f;              // parte imaginaria = 0
+        m->pd_freq[i][0] = re * re + im * im; // real power
+        m->pd_freq[i][1] = 0.0f;              // imag power = 0
     }
 
-    // === 4. IFFT → autocorrelación ===
+    // === 4. IFFT → autocorrelation ===
     fftwf_execute(m->pd_plan_inv);
 
     // === 5. Normalizar autocorrelación ===
@@ -216,7 +216,7 @@ static LV2_Handle instantiate (const struct LV2_Descriptor *descriptor, double
         return NULL;
     }
 
-    // ==== Pitch detection: reservar memoria FFTW ====
+    // ==== Pitch detection: mem for FFTW ====
     m->pd_time = (float*)fftwf_malloc(sizeof(float) * FFT_SIZE);
     m->pd_freq = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * (FFT_SIZE/2 + 1));
     m->pd_autocorr = (float*)fftwf_malloc(sizeof(float) * FFT_SIZE);
@@ -231,7 +231,7 @@ static LV2_Handle instantiate (const struct LV2_Descriptor *descriptor, double
         return NULL;
     }
 
-    // ==== Crear planes FFTW (no-RT, aquí sí se puede usar MEASURE) ====
+    // ==== Create FFTW plan (no-RT, here MEASURE can be used) ====
     m->pd_plan_fwd = fftwf_plan_dft_r2c_1d(
         FFT_SIZE, m->pd_time, m->pd_freq, FFTW_MEASURE);
     m->pd_plan_inv = fftwf_plan_dft_c2r_1d(
@@ -249,7 +249,6 @@ static LV2_Handle instantiate (const struct LV2_Descriptor *descriptor, double
         return NULL;
     }
 
-    //inicializar non GTP
     m->sample     = 0;
     m->calc_freq  = 0.0f;
     m->delay_pos  = 0;
@@ -304,6 +303,7 @@ simpleFeedback* m = (simpleFeedback*)instance;
     m->sample    = 0;
     m->calc_freq = 0.0f;
     m->delay_pos = 0;
+    m->effect_gain = 0.0f;
 
     if (m->active_ptr && *m->active_ptr < 0.5f)
         m->prev_active = 0;
@@ -350,6 +350,7 @@ static void run(LV2_Handle instance, uint32_t sample_count)
     /* Estado activo */
     if (m->prev_active == 0) {
         m->prev_active = 1;
+        m->effect_gain = 0.0f;  // when activate start with 0.
     }
 
     /* Solo recalculamos frecuencia si tenemos una ventana mínima */
@@ -369,19 +370,6 @@ static void run(LV2_Handle instance, uint32_t sample_count)
                 m->calc_freq = alpha * temp_freq + (1.0f - alpha) * m->calc_freq;
             }
 
-            /* Proteger harmonic_ptr por si el host manda 0 */
-            /*float harmonic = (*m->harmonic_ptr > 0.01f) ? *m->harmonic_ptr : 1.0f;
-
-            double delay = m->rate / (double)m->calc_freq / (double)harmonic;
-            if (delay < 1.0) {
-                delay = 1.0;
-            }
-            if (delay > buf_size - 1) {
-                delay = buf_size - 1;
-            }
-
-            m->delay_pos = (uint32_t)delay;*/
-
             m->delay_pos = (uint32_t)(m->rate / (m->calc_freq * (*m->harmonic_ptr > 0.01f ? *m->harmonic_ptr : 1.0f)));
 
             /* No hacer printf en tiempo real */
@@ -392,21 +380,51 @@ static void run(LV2_Handle instance, uint32_t sample_count)
         }
     }
 
+    // ==== ATTACK (fade-in del nivel de efecto) ====
+    float target_level = *m->level_ptr;
+    if (target_level < 0.0f) target_level = 0.0f;
+
+    float attack_norm = *m->attack_ptr;
+    if (attack_norm < 0.0f) attack_norm = 0.0f;
+    if (attack_norm > 1.0f) attack_norm = 1.0f;
+
+    const float ATK_MIN = 0.02f;
+    const float ATK_MAX = 2.0f;
+    float attack_time = ATK_MIN * powf(ATK_MAX / ATK_MIN, attack_norm);
+
+    float step;
+    if (attack_time <= 0.000001f) {
+        step = target_level;
+    } else {
+        step = target_level / (attack_time * (float)m->rate);
+        if (step > target_level) step = target_level;
+    }
+
     for (uint32_t i = 0; i < sample_count; ++i) {
-        //calculate which position we must read from buffer
+
+        // ramp lineal hacia target_level
+        if (m->effect_gain < target_level) {
+            m->effect_gain += step;
+            if (m->effect_gain > target_level)
+                m->effect_gain = target_level;
+        } else {
+            m->effect_gain = target_level;
+        }
+
         uint32_t eco_pos = (m->sample + buf_size - m->delay_pos) % buf_size;
 
         float delayed = m->buffer[eco_pos];
         float in      = m->in_ptr[i];
 
-        m->out_ptr[i] = in + delayed * (*m->level_ptr);
+        m->out_ptr[i] = in + delayed * m->effect_gain;
 
-        /* Guardamos señal con feedback en buffer, y la señal limpia en clean_buffer */
-        m->buffer[m->sample]       = in + delayed;
+        // feedback interno también con attack (clave)
+        m->buffer[m->sample] = in + delayed * m->effect_gain;
+
         m->clean_buffer[m->sample] = in;
-
         m->sample = (m->sample + 1U) % buf_size;
     }
+
 }
 
 static void deactivate(LV2_Handle instance)
