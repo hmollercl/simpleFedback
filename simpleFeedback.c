@@ -59,8 +59,16 @@ typedef struct {
     float calc_freq;
     uint8_t prev_active; // to know if it was activated before or not.
     int buffer_size;  // BUFFER_TIME * m->rate
-    int delay_pos;
+    float delay_pos;
     float effect_gain;   // ganancia “suavizada” del efecto, para usar attack_ptr
+    float bp_b0;
+    float bp_b1;
+    float bp_b2;
+    float bp_a1;
+    float bp_a2;
+    float bp_z1;
+    float bp_z2;
+    float bp_center_hz;
 
     // === Pitch detection (autocorrelación) ===
     float*          pd_time;      // buffer de entrada para la FFT (FFT_SIZE)
@@ -70,6 +78,42 @@ typedef struct {
     fftwf_plan      pd_plan_inv;  // plan IFFT c2r
 
 } simpleFeedback;
+
+static inline void
+update_bandpass_coeffs(simpleFeedback* m, float center_hz)
+{
+    const float q = 8.0f;
+    const float min_hz = 20.0f;
+    const float max_hz = 0.45f * (float)m->rate;
+
+    if (center_hz < min_hz) {
+        center_hz = min_hz;
+    } else if (center_hz > max_hz) {
+        center_hz = max_hz;
+    }
+
+    float w0 = 2.0f * (float)M_PI * center_hz / (float)m->rate;
+    float cos_w0 = cosf(w0);
+    float sin_w0 = sinf(w0);
+    float alpha = sin_w0 / (2.0f * q);
+
+    float a0 = 1.0f + alpha;
+    m->bp_b0 = alpha / a0;
+    m->bp_b1 = 0.0f;
+    m->bp_b2 = -alpha / a0;
+    m->bp_a1 = (-2.0f * cos_w0) / a0;
+    m->bp_a2 = (1.0f - alpha) / a0;
+    m->bp_center_hz = center_hz;
+}
+
+static inline float
+process_bandpass(simpleFeedback* m, float x)
+{
+    float y = m->bp_b0 * x + m->bp_z1;
+    m->bp_z1 = m->bp_b1 * x - m->bp_a1 * y + m->bp_z2;
+    m->bp_z2 = m->bp_b2 * x - m->bp_a2 * y;
+    return y;
+}
 
 static float
 autocorr_freq_rt(simpleFeedback* m,
@@ -251,7 +295,10 @@ static LV2_Handle instantiate (const struct LV2_Descriptor *descriptor, double
 
     m->sample     = 0;
     m->calc_freq  = 0.0f;
-    m->delay_pos  = 0;
+    m->delay_pos  = 0.0f;
+    m->bp_z1      = 0.0f;
+    m->bp_z2      = 0.0f;
+    update_bandpass_coeffs(m, 1000.0f);
     m->prev_active = 0;
 
     return m;
@@ -302,8 +349,10 @@ simpleFeedback* m = (simpleFeedback*)instance;
 
     m->sample    = 0;
     m->calc_freq = 0.0f;
-    m->delay_pos = 0;
+    m->delay_pos = 0.0f;
     m->effect_gain = 0.0f;
+    m->bp_z1 = 0.0f;
+    m->bp_z2 = 0.0f;
 
     if (m->active_ptr && *m->active_ptr < 0.5f)
         m->prev_active = 0;
@@ -342,6 +391,8 @@ static void run(LV2_Handle instance, uint32_t sample_count)
                 m->buffer[i] = 0.0f;
             }
             m->sample = 0;
+            m->bp_z1 = 0.0f;
+            m->bp_z2 = 0.0f;
             m->prev_active = 0;
         }
         return;
@@ -370,7 +421,18 @@ static void run(LV2_Handle instance, uint32_t sample_count)
                 m->calc_freq = alpha * temp_freq + (1.0f - alpha) * m->calc_freq;
             }
 
-            m->delay_pos = (uint32_t)(m->rate / (m->calc_freq * (*m->harmonic_ptr > 0.01f ? *m->harmonic_ptr : 1.0f)));
+            float harmonic = (*m->harmonic_ptr > 0.01f ? *m->harmonic_ptr : 1.0f);
+            float target_hz = m->calc_freq * harmonic;
+            m->delay_pos = (float)(m->rate / target_hz);
+            if (m->delay_pos < 1.0f) {
+                m->delay_pos = 1.0f;
+            } else if (m->delay_pos > (float)(buf_size - 1U)) {
+                m->delay_pos = (float)(buf_size - 1U);
+            }
+
+            if (fabsf(target_hz - m->bp_center_hz) > 0.5f) {
+                update_bandpass_coeffs(m, target_hz);
+            }
 
             /* No hacer printf en tiempo real */
             /* printf("%f\n", m->calc_freq); */
@@ -411,15 +473,22 @@ static void run(LV2_Handle instance, uint32_t sample_count)
             m->effect_gain = target_level;
         }
 
-        uint32_t eco_pos = (m->sample + buf_size - m->delay_pos) % buf_size;
+        float read_pos = (float)m->sample - m->delay_pos;
+        if (read_pos < 0.0f) {
+            read_pos += (float)buf_size;
+        }
 
-        float delayed = m->buffer[eco_pos];
+        uint32_t pos0 = (uint32_t)read_pos;
+        uint32_t pos1 = (pos0 + 1U) % buf_size;
+        float frac = read_pos - (float)pos0;
+        float delayed = m->buffer[pos0] + frac * (m->buffer[pos1] - m->buffer[pos0]);
         float in      = m->in_ptr[i];
 
         m->out_ptr[i] = in + delayed * m->effect_gain;
 
         // feedback interno también con attack (clave)
-        m->buffer[m->sample] = in + delayed * m->effect_gain;
+        float feedback_in = in + delayed * m->effect_gain;
+        m->buffer[m->sample] = process_bandpass(m, feedback_in);
 
         m->clean_buffer[m->sample] = in;
         m->sample = (m->sample + 1U) % buf_size;
