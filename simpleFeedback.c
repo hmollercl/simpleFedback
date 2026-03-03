@@ -33,8 +33,8 @@
 #include <sys/types.h>
 #include <float.h>
 #include <fftw3.h>
-#define F_MIN 300.0f     // Hz (Mi2 ~82 Hz, nota más baja)
-#define F_MAX 1200.0f    // Hz (trastes altos, agudos)
+#define F_MIN 100.0f     // Hz (Mi2 ~82 Hz, nota más baja)
+#define F_MAX 1400.0f    // Hz (trastes altos, agudos)
 #define FFT_SIZE 16384   // tamaño de la ventana para calcular fft
 
 
@@ -50,6 +50,7 @@ typedef struct {
     float* attack_ptr;
     float* active_ptr;
     float* harmonic_ptr;
+    float* lock_ptr;
 
     double rate;  //sample rate
 
@@ -60,7 +61,14 @@ typedef struct {
     uint8_t prev_active; // to know if it was activated before or not.
     int buffer_size;  // BUFFER_TIME * m->rate
     float delay_pos;
+    float delay_prev_pos;
+    float delay_xfade;
+    float delay_xfade_inc;
+    uint8_t delay_xfade_active;
     float effect_gain;   // ganancia “suavizada” del efecto, para usar attack_ptr
+    uint8_t freq_locked;
+    uint8_t onset_flag;
+    float onset_env;
     float bp_b0;
     float bp_b1;
     float bp_b2;
@@ -78,6 +86,39 @@ typedef struct {
     fftwf_plan      pd_plan_inv;  // plan IFFT c2r
 
 } simpleFeedback;
+
+static inline float
+clamp_delay_pos(float delay_pos, uint32_t buf_size)
+{
+    if (delay_pos < 1.0f) {
+        return 1.0f;
+    }
+    if (delay_pos > (float)(buf_size - 1U)) {
+        return (float)(buf_size - 1U);
+    }
+    return delay_pos;
+}
+
+static inline float
+read_delay_linear(const float* buffer, uint32_t write_pos, uint32_t buf_size, float delay_pos)
+{
+    float read_pos = (float)write_pos - delay_pos;
+    if (read_pos < 0.0f) {
+        read_pos += (float)buf_size;
+    }
+
+    uint32_t pos0 = (uint32_t)read_pos;
+    uint32_t pos1 = (pos0 + 1U) % buf_size;
+    float frac = read_pos - (float)pos0;
+    return buffer[pos0] + frac * (buffer[pos1] - buffer[pos0]);
+}
+
+static inline float
+soft_clip_fast(float x)
+{
+    float y = 1.4f * x;
+    return y / (1.0f + fabsf(y));
+}
 
 static inline void
 update_bandpass_coeffs(simpleFeedback* m, float center_hz)
@@ -206,6 +247,13 @@ autocorr_freq_rt(simpleFeedback* m,
         return 0.0f;
     }
 
+    // Si el mejor pico cae en el borde del rango buscado, suele ser una
+    // detección ambigua/saturada en F_MIN o F_MAX. En ese caso descartamos
+    // la estimación para mantener la frecuencia previa en run().
+    if (max_lag == lag_min || max_lag == lag_max) {
+        return 0.0f;
+    }
+
     // === 7. Evaluar calidad del pico (normalizado) ===
     float norm_peak = max_val / r0;
 
@@ -295,7 +343,14 @@ static LV2_Handle instantiate (const struct LV2_Descriptor *descriptor, double
 
     m->sample     = 0;
     m->calc_freq  = 0.0f;
-    m->delay_pos  = 0.0f;
+    m->delay_pos  = 1.0f;
+    m->delay_prev_pos = 1.0f;
+    m->delay_xfade = 1.0f;
+    m->delay_xfade_inc = 0.0f;
+    m->delay_xfade_active = 0;
+    m->freq_locked = 0;
+    m->onset_flag = 0;
+    m->onset_env = 0.0f;
     m->bp_z1      = 0.0f;
     m->bp_z2      = 0.0f;
     update_bandpass_coeffs(m, 1000.0f);
@@ -329,6 +384,9 @@ static void connect_port (LV2_Handle instance, uint32_t port, void
     case 5:
         m->harmonic_ptr = (float*) data_location;
         break;
+    case 6:
+        m->lock_ptr = (float*) data_location;
+        break;
     default:
         break;
     }
@@ -349,8 +407,15 @@ simpleFeedback* m = (simpleFeedback*)instance;
 
     m->sample    = 0;
     m->calc_freq = 0.0f;
-    m->delay_pos = 0.0f;
+    m->delay_pos = 1.0f;
+    m->delay_prev_pos = 1.0f;
+    m->delay_xfade = 1.0f;
+    m->delay_xfade_inc = 0.0f;
+    m->delay_xfade_active = 0;
     m->effect_gain = 0.0f;
+    m->freq_locked = 0;
+    m->onset_flag = 0;
+    m->onset_env = 0.0f;
     m->bp_z1 = 0.0f;
     m->bp_z2 = 0.0f;
 
@@ -391,6 +456,12 @@ static void run(LV2_Handle instance, uint32_t sample_count)
                 m->buffer[i] = 0.0f;
             }
             m->sample = 0;
+            m->delay_xfade_active = 0;
+            m->delay_xfade = 1.0f;
+            m->delay_xfade_inc = 0.0f;
+            m->freq_locked = 0;
+            m->onset_flag = 0;
+            m->onset_env = 0.0f;
             m->bp_z1 = 0.0f;
             m->bp_z2 = 0.0f;
             m->prev_active = 0;
@@ -402,10 +473,18 @@ static void run(LV2_Handle instance, uint32_t sample_count)
     if (m->prev_active == 0) {
         m->prev_active = 1;
         m->effect_gain = 0.0f;  // when activate start with 0.
+        m->delay_xfade_active = 0;
+        m->delay_xfade = 1.0f;
     }
 
     /* Solo recalculamos frecuencia si tenemos una ventana mínima */
     const uint32_t min_samples = (uint32_t)(4.0 * m->rate / (double)MIN_FREQ);
+    const float xfade_time_sec = 0.02f;
+    const float lock_in_rel = 0.06f;
+    const float lock_out_rel = 0.12f;
+    uint8_t onset_now = m->onset_flag;
+    m->onset_flag = 0;
+
     if (m->sample > min_samples) {
         temp_freq = (float)autocorr_freq_rt(m,
                                        m->clean_buffer,
@@ -413,32 +492,60 @@ static void run(LV2_Handle instance, uint32_t sample_count)
                                        m->buffer_size);
 
         if (temp_freq > 0.0f) {
-            // Hay un pitch confiable → actualiza, idealmente con suavizado
-            const float alpha = 0.3f; // 0 = ultra suave, 1 = sin suavizado
-            if (m->calc_freq <= 0.0f) {
-                m->calc_freq = temp_freq;
+            uint8_t accept_update = 0;
+            uint8_t lock_enabled = (!m->lock_ptr || *m->lock_ptr >= 0.5f);
+            if (!lock_enabled) {
+                accept_update = 1;
+                m->freq_locked = 0;
+            } else if (m->calc_freq <= 0.0f) {
+                accept_update = 1;
+                m->freq_locked = 1;
             } else {
-                m->calc_freq = alpha * temp_freq + (1.0f - alpha) * m->calc_freq;
+                float rel_diff = fabsf(temp_freq - m->calc_freq) / fmaxf(m->calc_freq, 1.0f);
+                if (m->freq_locked) {
+                    if (rel_diff <= lock_out_rel || onset_now) {
+                        accept_update = 1;
+                    } else {
+                        m->freq_locked = 0;
+                    }
+                } else if (rel_diff <= lock_in_rel || onset_now) {
+                    accept_update = 1;
+                    m->freq_locked = 1;
+                }
             }
 
-            float harmonic = (*m->harmonic_ptr > 0.01f ? *m->harmonic_ptr : 1.0f);
-            float target_hz = m->calc_freq * harmonic;
-            m->delay_pos = (float)(m->rate / target_hz);
-            if (m->delay_pos < 1.0f) {
-                m->delay_pos = 1.0f;
-            } else if (m->delay_pos > (float)(buf_size - 1U)) {
-                m->delay_pos = (float)(buf_size - 1U);
-            }
+            if (accept_update) {
+                // Hay un pitch confiable y estable → actualiza con suavizado
+                const float alpha = 0.3f; // 0 = ultra suave, 1 = sin suavizado
+                if (m->calc_freq <= 0.0f) {
+                    m->calc_freq = temp_freq;
+                } else {
+                    m->calc_freq = alpha * temp_freq + (1.0f - alpha) * m->calc_freq;
+                }
 
-            if (fabsf(target_hz - m->bp_center_hz) > 0.5f) {
-                update_bandpass_coeffs(m, target_hz);
-            }
+                float harmonic = (*m->harmonic_ptr > 0.01f ? *m->harmonic_ptr : 1.0f);
+                float target_hz = m->calc_freq * harmonic;
+                if (target_hz > 1.0f) {
+                    float new_delay_pos = clamp_delay_pos((float)(m->rate / target_hz), buf_size);
+                    if (fabsf(new_delay_pos - m->delay_pos) > 0.0001f) {
+                        m->delay_prev_pos = m->delay_pos;
+                        m->delay_pos = new_delay_pos;
+                        m->delay_xfade = 0.0f;
+                        m->delay_xfade_inc = 1.0f / fmaxf(1.0f, xfade_time_sec * (float)m->rate);
+                        m->delay_xfade_active = 1;
+                    }
+                }
 
-            /* No hacer printf en tiempo real */
-            /* printf("%f\n", m->calc_freq); */
-            #ifdef DEBUG
-            printf("%f\n", m->calc_freq);
-            #endif
+                if (fabsf(target_hz - m->bp_center_hz) > 0.5f) {
+                    update_bandpass_coeffs(m, target_hz);
+                }
+
+                /* No hacer printf en tiempo real */
+                /* printf("%f\n", m->calc_freq); */
+                #ifdef DEBUG
+                printf("%f\n", m->calc_freq);
+                #endif
+            }
         }
     }
 
@@ -462,6 +569,7 @@ static void run(LV2_Handle instance, uint32_t sample_count)
         if (step > target_level) step = target_level;
     }
 
+    float block_peak = 0.0f;
     for (uint32_t i = 0; i < sample_count; ++i) {
 
         // ramp lineal hacia target_level
@@ -473,26 +581,40 @@ static void run(LV2_Handle instance, uint32_t sample_count)
             m->effect_gain = target_level;
         }
 
-        float read_pos = (float)m->sample - m->delay_pos;
-        if (read_pos < 0.0f) {
-            read_pos += (float)buf_size;
+        float delayed = read_delay_linear(m->buffer, (uint32_t)m->sample, buf_size, m->delay_pos);
+        if (m->delay_xfade_active) {
+            float delayed_prev = read_delay_linear(m->buffer, (uint32_t)m->sample, buf_size, m->delay_prev_pos);
+            delayed = delayed_prev + (delayed - delayed_prev) * m->delay_xfade;
+            m->delay_xfade += m->delay_xfade_inc;
+            if (m->delay_xfade >= 1.0f) {
+                m->delay_xfade = 1.0f;
+                m->delay_xfade_active = 0;
+                m->delay_prev_pos = m->delay_pos;
+            }
         }
 
-        uint32_t pos0 = (uint32_t)read_pos;
-        uint32_t pos1 = (pos0 + 1U) % buf_size;
-        float frac = read_pos - (float)pos0;
-        float delayed = m->buffer[pos0] + frac * (m->buffer[pos1] - m->buffer[pos0]);
         float in      = m->in_ptr[i];
+        float abs_in = fabsf(in);
+        if (abs_in > block_peak) {
+            block_peak = abs_in;
+        }
 
         m->out_ptr[i] = in + delayed * m->effect_gain;
 
         // feedback interno también con attack (clave)
         float feedback_in = in + delayed * m->effect_gain;
-        m->buffer[m->sample] = process_bandpass(m, feedback_in);
+        float clipped = soft_clip_fast(feedback_in);
+        m->buffer[m->sample] = process_bandpass(m, clipped);
 
         m->clean_buffer[m->sample] = in;
         m->sample = (m->sample + 1U) % buf_size;
     }
+
+    // onset simple por bloque (para permitir relock cuando hay ataque nuevo)
+    if (block_peak > 0.03f && block_peak > 1.8f * m->onset_env) {
+        m->onset_flag = 1;
+    }
+    m->onset_env = 0.995f * m->onset_env + 0.005f * block_peak;
 
 }
 
