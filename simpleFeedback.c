@@ -456,6 +456,9 @@ static void run(LV2_Handle instance, uint32_t sample_count)
                 m->buffer[i] = 0.0f;
             }
             m->sample = 0;
+            m->calc_freq = 0.0f;
+            m->delay_pos = 1.0f;
+            m->delay_prev_pos = 1.0f;
             m->delay_xfade_active = 0;
             m->delay_xfade = 1.0f;
             m->delay_xfade_inc = 0.0f;
@@ -473,8 +476,15 @@ static void run(LV2_Handle instance, uint32_t sample_count)
     if (m->prev_active == 0) {
         m->prev_active = 1;
         m->effect_gain = 0.0f;  // when activate start with 0.
+        m->calc_freq = 0.0f;
+        m->delay_pos = 1.0f;
+        m->delay_prev_pos = 1.0f;
         m->delay_xfade_active = 0;
         m->delay_xfade = 1.0f;
+        m->delay_xfade_inc = 0.0f;
+        m->freq_locked = 0;
+        m->onset_flag = 0;
+        m->onset_env = 0.0f;
     }
 
     /* Solo recalculamos frecuencia si tenemos una ventana mínima */
