@@ -1,13 +1,11 @@
 # simpleFedback
 Simple Feedback LV2 plugin
 
-currently it's only is a small mono delay
+currently it's a mono delay with time calculated according to the detect main frequency and some filters.
 
-TODO:
-detect frequency and add passband filter for it.
 
 to build:
-```gcc -fvisibility=hidden -fPIC -Wl,-Bstatic -Wl,-Bdynamic -Wl,--as-needed -shared -pthread `pkg-config --cflags lv2` -lm `pkg-config --libs lv2` simpleFeedback.c -o simpleFeedback.so -lfftw3f```
+use make
 
 needed in ubuntu:
 ```sudo apt install build-essential pkg-config lv2-dev libfftw3-dev```
