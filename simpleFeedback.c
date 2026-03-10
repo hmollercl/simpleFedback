@@ -580,6 +580,9 @@ static void run(LV2_Handle instance, uint32_t sample_count)
     }
 
     float block_peak = 0.0f;
+    const float idle_in_thresh = 0.00035f;       // ~ -69 dBFS
+    const float silence_state_thresh = 0.00004f; // ~ -88 dBFS
+    const float max_idle_feedback = 0.992f;
     for (uint32_t i = 0; i < sample_count; ++i) {
 
         // ramp lineal hacia target_level
@@ -609,12 +612,24 @@ static void run(LV2_Handle instance, uint32_t sample_count)
             block_peak = abs_in;
         }
 
-        m->out_ptr[i] = in + delayed * m->effect_gain;
+        float wet = delayed * m->effect_gain;
+        m->out_ptr[i] = in + wet;
 
         // feedback interno también con attack (clave)
-        float feedback_in = in + delayed * m->effect_gain;
-        float clipped = soft_clip_fast(feedback_in);
-        m->buffer[m->sample] = process_bandpass(m, clipped);
+        float loop_feedback = m->effect_gain;
+        if (abs_in < idle_in_thresh && loop_feedback > max_idle_feedback) {
+            loop_feedback = max_idle_feedback;
+        }
+
+        float feedback_in = in + delayed * loop_feedback;
+        if (abs_in < silence_state_thresh && fabsf(delayed) < silence_state_thresh) {
+            m->buffer[m->sample] = 0.0f;
+            m->bp_z1 = 0.0f;
+            m->bp_z2 = 0.0f;
+        } else {
+            float clipped = soft_clip_fast(feedback_in);
+            m->buffer[m->sample] = process_bandpass(m, clipped);
+        }
 
         m->clean_buffer[m->sample] = in;
         m->sample = (m->sample + 1U) % buf_size;
